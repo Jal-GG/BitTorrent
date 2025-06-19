@@ -6,6 +6,8 @@ import hashlib
 import struct
 import os
 from urllib.parse import urlparse, urlencode
+import threading
+import queue
 
 # --- Step 1: Parse .torrent file ---
 def parse_torrent(torrent_path):
@@ -29,22 +31,31 @@ def parse_torrent(torrent_path):
 
 # --- Step 2: Contact tracker ---
 def get_peers(meta, peer_id, port=6881):
+    # Prepare parameters except info_hash and peer_id
     params = {
-        'info_hash': meta['info_hash'],
-        'peer_id': peer_id,
-        'port': port,
-        'uploaded': 0,
-        'downloaded': 0,
-        'left': meta['length'],
-        'compact': 1,
+        'port': str(port),
+        'uploaded': '0',
+        'downloaded': '0',
+        'left': str(meta['length']),
+        'compact': '1',
         'event': 'started'
     }
-    url = meta['announce'] + '?' + urlencode(params, quote_via=lambda x, *_: x)
-    # info_hash and peer_id must be bytes, not urlencoded
-    url = url.replace('info_hash=' + str(meta['info_hash']), 'info_hash=' + requests.utils.quote(meta['info_hash'], safe=''))
-    url = url.replace('peer_id=' + str(peer_id), 'peer_id=' + requests.utils.quote(peer_id, safe=''))
+    # Build base URL
+    url = meta['announce'] + '?'
+    # Add info_hash and peer_id as percent-encoded bytes
+    url += 'info_hash=' + requests.utils.quote(meta['info_hash'], safe='')
+    url += '&peer_id=' + requests.utils.quote(peer_id, safe='')
+    # Add the rest of the params
+    for k, v in params.items():
+        url += f'&{k}={v}'
     r = requests.get(url, timeout=10)
     tracker = bencodepy.decode(r.content)
+    if b'failure reason' in tracker:
+        print('Tracker failure:', tracker[b'failure reason'].decode(errors='replace'))
+        return []
+    if b'peers' not in tracker:
+        print('No peers found in tracker response:', tracker)
+        return []
     peers = tracker[b'peers']
     # peers is a binary string of 6-byte entries (4 bytes IP, 2 bytes port)
     peer_list = []
@@ -64,41 +75,74 @@ def handshake(sock, info_hash, peer_id):
         raise Exception('Info hash does not match')
 
 # --- Step 4: Download pieces ---
-def download(meta, peer, peer_id):
-    sock = socket.socket()
-    sock.settimeout(5)
-    sock.connect(peer)
-    handshake(sock, meta['info_hash'], peer_id)
-    # Send interested
-    sock.sendall(b'\x00\x00\x00\x01\x02')
-    # Wait for unchoke
-    while True:
-        msg = sock.recv(4096)
-        if b'\x01' in msg:  # unchoke
-            break
-    # Download first piece (for demo)
-    piece_index = 0
-    begin = 0
-    length = min(meta['piece_length'], meta['length'])
-    # Send request
-    req = struct.pack('>IBIII', 13, 6, piece_index, begin, length)
-    sock.sendall(req)
-    # Receive piece
-    data = b''
-    while len(data) < length + 13:
-        chunk = sock.recv(length + 13 - len(data))
-        if not chunk:
-            break
-        data += chunk
-    # Piece message: <len=0009+X><id=7><index><begin><block>
-    if data[4] == 7:
-        block = data[13:]
-        with open(meta['name'] + '.part', 'wb') as f:
-            f.write(block)
-        print(f"Downloaded first piece to {meta['name']}.part")
-    else:
-        print("Failed to download piece.")
-    sock.close()
+def download_worker(meta, peer, peer_id, piece_queue, piece_hashes, file_lock, file_name, piece_length, file_length):
+    try:
+        sock = socket.socket()
+        sock.settimeout(5)
+        sock.connect(peer)
+        handshake(sock, meta['info_hash'], peer_id)
+        # Send interested
+        sock.sendall(b'\x00\x00\x00\x01\x02')
+        # Wait for unchoke
+        while True:
+            msg = sock.recv(4096)
+            if b'\x01' in msg:  # unchoke
+                break
+        while True:
+            try:
+                piece_index = piece_queue.get_nowait()
+            except queue.Empty:
+                break
+            begin = 0
+            length = min(piece_length, file_length - piece_index * piece_length)
+            req = struct.pack('>IBIII', 13, 6, piece_index, begin, length)
+            sock.sendall(req)
+            data = b''
+            while len(data) < length + 13:
+                chunk = sock.recv(length + 13 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) < length + 13 or data[4] != 7:
+                print(f"Peer {peer} failed to download piece {piece_index}")
+                piece_queue.put(piece_index)  # Put back for another peer
+                continue
+            block = data[13:]
+            if hashlib.sha1(block).digest() != piece_hashes[piece_index]:
+                print(f"Peer {peer} hash mismatch for piece {piece_index}")
+                piece_queue.put(piece_index)
+                continue
+            with file_lock:
+                with open(file_name + '.part', 'r+b') as f:
+                    f.seek(piece_index * piece_length)
+                    f.write(block)
+            print(f"Peer {peer} downloaded piece {piece_index}")
+        sock.close()
+    except Exception as e:
+        print(f"Peer {peer} error: {e}")
+
+def download(meta, peers, peer_id):
+    num_pieces = len(meta['pieces']) // 20
+    piece_hashes = [meta['pieces'][i*20:(i+1)*20] for i in range(num_pieces)]
+    file_length = meta['length']
+    piece_length = meta['piece_length']
+    file_name = meta['name']
+    with open(file_name + '.part', 'wb') as f:
+        f.truncate(file_length)
+    piece_queue = queue.Queue()
+    for i in range(num_pieces):
+        piece_queue.put(i)
+    file_lock = threading.Lock()
+    threads = []
+    max_peers = min(4, len(peers))
+    print(f"Starting download with {max_peers} peers and {num_pieces} pieces")
+    for i in range(max_peers):
+        t = threading.Thread(target=download_worker, args=(meta, peers[i], peer_id, piece_queue, piece_hashes, file_lock, file_name, piece_length, file_length))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    print(f"Download complete. Saved as {file_name}.part")
 
 # --- Main ---
 def main():
@@ -109,10 +153,10 @@ def main():
     meta = parse_torrent(sys.argv[1])
     peer_id = b'-PC0001-' + bytes(random.choices(b'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=12))
     peers = get_peers(meta, peer_id)
-    print(f"Found {len(peers)} peers. Connecting to first peer...")
+    print(f"Found {len(peers)} peers. Connecting to up to 4 peers...")
     if peers:
         try:
-            download(meta, peers[0], peer_id)
+            download(meta, peers, peer_id)
         except Exception as e:
             print(f"Error: {e}")
     else:
